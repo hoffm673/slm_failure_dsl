@@ -47,6 +47,11 @@ def build_pipeline(model) -> Pipeline:
             FailureMode.SCHEMA_VIOLATION,
             FailureMode.REFUSAL,
             FailureMode.HALLUCINATED_ENTITY,
+            FailureMode.INSTRUCTION_NEGLECT,
+            FailureMode.TOOL_INVOCATION_ERROR,
+            FailureMode.ENTITY_OMISSION,
+            FailureMode.COMMON_NOUN_AS_ENTITY,
+
         ],
     )
     def extract(ctx: dict) -> StepResult:

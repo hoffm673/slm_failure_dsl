@@ -192,7 +192,216 @@ def detect_tool_invocation_error(
         return True
     return False
 
-
+_DAYS_MONTHS_STOPS = {
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "january", "february", "march", "april", "may", "june", "july",
+    "august", "september", "october", "november", "december",
+    "today", "tomorrow", "yesterday",
+}
+ 
+# Titles look like proper nouns but aren't standalone entities.
+_TITLES = {
+    "mr", "mrs", "ms", "miss", "dr", "prof", "professor", "sir", "lord",
+    "lady", "rev", "reverend", "hon", "honorable", "honourable",
+    "sen", "senator", "rep", "representative", "gov", "governor",
+    "pres", "president",
+}
+ 
+# Sentence-initial words that aren't entities even when capitalized.
+_SENTENCE_INITIAL_STOPWORDS = {
+    # function words
+    "the", "a", "an", "this", "that", "these", "those",
+    "it", "they", "we", "i", "he", "she", "you",
+    "but", "and", "or", "so", "if", "when", "while", "after", "before",
+    "however", "moreover", "meanwhile", "still", "yet", "also",
+    "last", "next", "first", "second", "third", "fourth",
+    "there", "here", "now", "then",
+    "both", "either", "neither", "some", "any", "all",
+    "during", "throughout",
+    # common nouns often appearing sentence-initial in news/business text;
+    # without this list, rule (c) would over-flag (e.g. "Investors responded...")
+    "ceo", "cto", "cfo", "coo", "founder", "executive", "executives",
+    "investors", "shareholders", "regulators", "officials", "analysts",
+    "customers", "users", "employees", "workers", "researchers",
+    "scientists", "doctors", "lawyers", "experts", "critics",
+    "company", "companies", "team", "teams", "group", "groups",
+    "according", "reports", "sources", "results", "data",
+}
+ 
+_PROPER_NOUN_RE = re.compile(r"\b[A-Z][a-zA-Z][a-zA-Z0-9.\-]*\b")
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+_TOKEN_RE = re.compile(r"\b[A-Za-z][A-Za-z\-]*\b")
+ 
+ 
+# ---------------------------------------------------------------------------
+# 1. ENTITY_OMISSION
+# ---------------------------------------------------------------------------
+# A salient entity from the source is missing from the output's entity list.
+#
+# Salience rule, tuned for low false positives:
+#   A token is salient iff (after lowercasing) it is NOT in any stop list
+#   AND either
+#     (a) it appears capitalized at least once mid-sentence (strong proof
+#         it's a proper noun, not just sentence-initial capitalization), OR
+#     (b) it appears capitalized in at least 2 distinct sentences
+#         (recurrence is also strong evidence)
+#
+# Then we check each salient entity appears (substring, case-insensitive)
+# in the flattened output entity list.
+ 
+def _extract_salient_entities(source: str) -> set[str]:
+    """
+    Return the set of source tokens we'll require to appear in the output.
+    Deliberately conservative.
+    """
+    # tok_lower -> {"mid": int, "sentences": set of sentence indices seen in}
+    stats: dict[str, dict] = {}
+    sentences = _SENTENCE_SPLIT_RE.split(source.strip())
+ 
+    for s_idx, sentence in enumerate(sentences):
+        for m in _PROPER_NOUN_RE.finditer(sentence):
+            lower = m.group().lower()
+            entry = stats.setdefault(lower, {"mid": 0, "sentences": set()})
+            entry["sentences"].add(s_idx)
+            # mid-sentence = not at the start of the sentence
+            preceding = sentence[:m.start()]
+            if preceding.strip():
+                entry["mid"] += 1
+ 
+    salient = set()
+    for lower, info in stats.items():
+        if lower in _DAYS_MONTHS_STOPS:
+            continue
+        if lower in _SENTENCE_INITIAL_STOPWORDS:
+            continue
+        if lower in _TITLES:
+            continue
+        # Rule (a): mid-sentence capitalization — strong evidence
+        # Rule (b): appears capitalized across 2+ sentences — also strong
+        # Rule (c): sentence-initial only, but length >= 3 and not in
+        #   stop lists — weaker but necessary to catch lead-subject entities
+        #   like "Apple released..." where the article opens with the main entity
+        if info["mid"] >= 1 or len(info["sentences"]) >= 2 or len(lower) >= 3:
+            salient.add(lower)
+    return salient
+ 
+ 
+def _entities_to_strings(entities: Any) -> list[str]:
+    """
+    Flatten the output `entities` field to a list of strings, accepting
+    either ['Apple', 'Tim Cook'] or [{'name': 'Apple', 'role': 'company'}, ...].
+    """
+    if not isinstance(entities, list):
+        return []
+    out = []
+    for e in entities:
+        if isinstance(e, str):
+            out.append(e)
+        elif isinstance(e, dict):
+            name = e.get("name") or e.get("entity") or e.get("text")
+            if isinstance(name, str):
+                out.append(name)
+    return out
+ 
+ 
+def detect_entity_omission(
+    output: Any,
+    source_context: str,
+    entities_field: str = "entities",
+) -> bool:
+    """
+    Fires if any salient entity from the source is missing from the output.
+ 
+    `output` may be the parsed JSON dict (we look for output[entities_field])
+    or a list of entities directly.
+    """
+    if isinstance(output, dict):
+        entities = output.get(entities_field, [])
+    else:
+        entities = output
+ 
+    output_strings = _entities_to_strings(entities)
+    output_haystack = " ".join(output_strings).lower()
+ 
+    salient = _extract_salient_entities(source_context)
+    if not salient:
+        return False
+ 
+    for required in salient:
+        if required not in output_haystack:
+            return True
+    return False
+ 
+ 
+# ---------------------------------------------------------------------------
+# 2. COMMON_NOUN_AS_ENTITY
+# ---------------------------------------------------------------------------
+# Fires when an entity in the output is a single-token term that appears
+# strictly lowercase mid-sentence in the source AND never appears
+# capitalized mid-sentence.
+#
+# This catches "restaurant"/"chef" without flagging "Microsoft" (which
+# appears capitalized — sentence-initial or not).
+#
+# Multi-word entities are not flagged here — they're handled by
+# hallucinated_entity if hallucinated.
+ 
+def _appears_strictly_lowercase_midsentence(source: str, term: str) -> bool:
+    """Does `term` appear strictly lowercase in a non-sentence-initial position?"""
+    term_lower = term.lower()
+    sentences = _SENTENCE_SPLIT_RE.split(source.strip())
+    for sentence in sentences:
+        for i, m in enumerate(_TOKEN_RE.finditer(sentence)):
+            if m.group().lower() != term_lower:
+                continue
+            if i == 0:  # sentence-initial
+                continue
+            if m.group() == m.group().lower():
+                return True
+    return False
+ 
+ 
+def _appears_capitalized_midsentence(source: str, term: str) -> bool:
+    """Does `term` appear capitalized in a non-sentence-initial position?"""
+    term_lower = term.lower()
+    sentences = _SENTENCE_SPLIT_RE.split(source.strip())
+    for sentence in sentences:
+        for i, m in enumerate(_TOKEN_RE.finditer(sentence)):
+            if m.group().lower() != term_lower:
+                continue
+            if i == 0:
+                continue
+            if m.group()[0].isupper():
+                return True
+    return False
+ 
+ 
+def detect_common_noun_as_entity(
+    output: Any,
+    source_context: str,
+    entities_field: str = "entities",
+) -> bool:
+    """
+    Fires if any single-token output entity appears strictly lowercase
+    mid-sentence in the source and never appears capitalized mid-sentence.
+    """
+    if isinstance(output, dict):
+        entities = output.get(entities_field, [])
+    else:
+        entities = output
+ 
+    for ent_str in _entities_to_strings(entities):
+        ent_str = ent_str.strip()
+        if not ent_str or " " in ent_str:
+            continue
+        if (_appears_strictly_lowercase_midsentence(source_context, ent_str)
+                and not _appears_capitalized_midsentence(source_context, ent_str)):
+            return True
+    return False
+ 
+ 
+# ---------------------------------------------------------------------------
+# REGISTRY ADDITIONS — drop these into detectors.py / core.py
 # ---------- registry ----------
 
 DETECTORS = {
@@ -201,6 +410,9 @@ DETECTORS = {
     FailureMode.INSTRUCTION_NEGLECT: detect_instruction_neglect,
     FailureMode.REFUSAL: detect_refusal,
     FailureMode.TOOL_INVOCATION_ERROR: detect_tool_invocation_error,
+    FailureMode.ENTITY_OMISSION:       detect_entity_omission,
+    FailureMode.COMMON_NOUN_AS_ENTITY: detect_common_noun_as_entity,
+
     # LATENT_INCONSISTENCY: harness-level
     # CONTEXT_BOUNDARY_DEGRADATION: harness-level (compare base vs. padded)
     # REASONING_DRIFT: requires reasoning trace, defer
