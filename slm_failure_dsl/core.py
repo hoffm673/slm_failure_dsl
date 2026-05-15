@@ -40,6 +40,8 @@ class FailureMode(enum.Enum):
     HALLUCINATED_ENTITY = "hallucinated_entity"         # output references entity not in input/context
     INSTRUCTION_NEGLECT = "instruction_neglect"         # explicit instruction in prompt ignored
     REFUSAL = "refusal"                                 # model declines benign request
+    ENTITY_OMISSION       = "entity_omission"
+    COMMON_NOUN_AS_ENTITY = "common_noun_as_entity"
 
 
 @dataclass
