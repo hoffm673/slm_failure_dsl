@@ -24,6 +24,8 @@ from slm_failure_dsl.detectors import (
     detect_hallucinated_entity,
     detect_refusal,
     detect_schema_violation,
+    detect_entity_omission,
+    detect_common_noun_as_entity,
 )
 
 
@@ -77,7 +79,7 @@ def build_pipeline(model) -> Pipeline:
         if detect_schema_violation(parsed, EXTRACT_SCHEMA, raw):
             fired.append(FailureMode.SCHEMA_VIOLATION)
 
-        # only attempt hallucination check if entities are well-typed strings
+# only attempt hallucination check if entities are well-typed strings
         if (
             parsed
             and isinstance(parsed, dict)
@@ -88,6 +90,13 @@ def build_pipeline(model) -> Pipeline:
                 entity_text = " ".join(entity_strs)
                 if detect_hallucinated_entity(entity_text, passage):
                     fired.append(FailureMode.HALLUCINATED_ENTITY)
+
+        # semantic detectors: entity omission and common-noun-as-entity
+        if parsed and isinstance(parsed, dict):
+            if detect_entity_omission(parsed, passage):
+                fired.append(FailureMode.ENTITY_OMISSION)
+            if detect_common_noun_as_entity(parsed, passage):
+                fired.append(FailureMode.COMMON_NOUN_AS_ENTITY)
 
         return StepResult(output=parsed, fired_failures=fired, raw_text=raw)
 
