@@ -42,6 +42,8 @@ class FailureMode(enum.Enum):
     REFUSAL = "refusal"                                 # model declines benign request
     ENTITY_OMISSION       = "entity_omission"
     COMMON_NOUN_AS_ENTITY = "common_noun_as_entity"
+    SENTIMENT_MISMATCH    = "sentiment_mismatch"    # output sentiment contradicts source
+    OUTPUT_TRUNCATION     = "output_truncation"     # response cut off before completing
 
 
 @dataclass

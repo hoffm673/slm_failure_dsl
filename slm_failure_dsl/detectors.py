@@ -401,6 +401,76 @@ def detect_common_noun_as_entity(
  
  
 # ---------------------------------------------------------------------------
+# 3. SENTIMENT_MISMATCH
+# ---------------------------------------------------------------------------
+# Fires when the model's declared sentiment label contradicts a lexicon-based
+# signal computed from the source passage.
+#
+# Only fires when the source has a clear dominant polarity (|pos - neg| > 3)
+# AND the model returns the opposite label. "neutral" is never penalised —
+# it's always a defensible hedge.
+
+_POSITIVE_WORDS = {
+    "good", "great", "excellent", "positive", "success", "successful",
+    "improved", "improvement", "growth", "strong", "innovative", "remarkable",
+    "winning", "progress", "thriving", "better", "best", "pleased",
+    "satisfied", "approved", "landmark", "record", "surpassed", "optimistic",
+    "promising", "effective", "outstanding", "praised", "celebrated",
+    "confirmed", "launched", "achieved", "beat", "exceeded",
+}
+
+_NEGATIVE_WORDS = {
+    "bad", "poor", "failed", "failure", "decline", "declining", "drop",
+    "fell", "fall", "loss", "concern", "worried", "problem", "issue",
+    "crisis", "slow", "rejected", "charged", "arrested", "collapsed",
+    "disappointing", "inadequate", "insufficient", "rude", "lost",
+    "cut", "cuts", "lawsuit", "penalty", "fine", "deficit", "shortage",
+    "destroyed", "damaged", "collapsed", "devastated", "emergency",
+    "collapsed", "broke", "convicted", "sentenced", "condemned",
+}
+
+
+def detect_sentiment_mismatch(model_sentiment: str, source_context: str) -> bool:
+    """
+    Fires when the model labels sentiment as the clear opposite of what a
+    simple word-count over the source suggests.
+    """
+    words = re.findall(r"\b[a-z]+\b", source_context.lower())
+    word_set = set(words)
+    pos = len(word_set & _POSITIVE_WORDS)
+    neg = len(word_set & _NEGATIVE_WORDS)
+    if abs(pos - neg) <= 3:
+        return False  # ambiguous — don't flag
+    dominant = "positive" if pos > neg else "negative"
+    opposite = "negative" if dominant == "positive" else "positive"
+    return model_sentiment == opposite
+
+
+# ---------------------------------------------------------------------------
+# 4. OUTPUT_TRUNCATION
+# ---------------------------------------------------------------------------
+# Fires when the raw model output appears to have been cut off mid-generation.
+# A well-formed response ends with sentence-terminal or closing punctuation.
+# A truncated one ends mid-word, mid-number, or with a comma/colon.
+
+_TERMINAL_CHARS = frozenset('.!?"\']})')
+
+
+def detect_output_truncation(raw_text: str | None) -> bool:
+    """
+    Fires when raw_text ends without terminal punctuation, suggesting the
+    model hit max_new_tokens before finishing. Distinct root cause from
+    schema_violation (formatting intent vs. capacity).
+    """
+    if not raw_text:
+        return False
+    stripped = raw_text.rstrip()
+    if len(stripped) < 40:
+        return False  # too short to distinguish truncation from refusal
+    return stripped[-1] not in _TERMINAL_CHARS
+
+
+# ---------------------------------------------------------------------------
 # REGISTRY ADDITIONS — drop these into detectors.py / core.py
 # ---------- registry ----------
 
@@ -412,6 +482,8 @@ DETECTORS = {
     FailureMode.TOOL_INVOCATION_ERROR: detect_tool_invocation_error,
     FailureMode.ENTITY_OMISSION:       detect_entity_omission,
     FailureMode.COMMON_NOUN_AS_ENTITY: detect_common_noun_as_entity,
+    FailureMode.SENTIMENT_MISMATCH:    detect_sentiment_mismatch,
+    FailureMode.OUTPUT_TRUNCATION:     detect_output_truncation,
 
     # LATENT_INCONSISTENCY: harness-level
     # CONTEXT_BOUNDARY_DEGRADATION: harness-level (compare base vs. padded)

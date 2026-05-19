@@ -38,31 +38,89 @@ class Perturbation:
     apply: Callable[[str, random.Random], str]
 
 
-# ---------- paraphrase (rule-based) ----------
+# ---------- sentence shuffle ----------
+# Replaces the broken synonym-swap paraphrase. The old synonym dict contained
+# task-instruction verbs ("summarize", "extract") that never appear in seed
+# passages, so it was a near-no-op. Sentence reordering genuinely changes
+# passage structure and stresses both entity_omission and latent_inconsistency.
 
-_SYNONYMS = {
-    "summarize": ["sum up", "give a summary of", "briefly describe"],
-    "extract": ["pull out", "identify", "find"],
-    "list": ["enumerate", "name"],
-    "explain": ["describe", "clarify"],
-    "important": ["key", "critical", "notable"],
-    "quickly": ["rapidly", "fast"],
-    "good": ["fine", "decent"],
-    "bad": ["poor", "subpar"],
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def sentence_shuffle(text: str, rng: random.Random) -> str:
+    sentences = _SENT_SPLIT_RE.split(text.strip())
+    if len(sentences) <= 1:
+        return text
+    rng.shuffle(sentences)
+    return " ".join(sentences)
+
+
+# ---------- entity swap ----------
+# Replaces 1-2 proper nouns in the passage with plausible alternatives from
+# a fixed pool. Directly stresses hallucinated_entity (the replacement won't
+# appear in the source the model saw during training) and entity_omission
+# (the original entity is gone; will the model invent it anyway?).
+
+_SWAP_POOL = [
+    "James Carter", "Elena Vasquez", "David Park", "Amara Osei",
+    "Priya Mehta", "Lars Eriksson", "Sofia Reyes", "Omar Hassan",
+    "Nexus Corp", "Meridian Group", "Vertex Technologies", "Crestline Industries",
+    "Singapore", "Toronto", "Amsterdam", "Vienna", "Nairobi", "Lisbon",
+]
+
+_PERT_STOPWORDS = {
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "january", "february", "march", "april", "may", "june", "july",
+    "august", "september", "october", "november", "december",
+    "the", "this", "that", "these", "those", "there", "here",
 }
 
+_PROPER_NOUN_PAT = re.compile(r"\b[A-Z][a-zA-Z]{2,}\b")
 
-def paraphrase_rule_based(text: str, rng: random.Random) -> str:
-    words = re.split(r"(\W+)", text)
-    out = []
-    for w in words:
-        lw = w.lower()
-        if lw in _SYNONYMS and rng.random() < 0.5:
-            replacement = rng.choice(_SYNONYMS[lw])
-            out.append(replacement if not w[0].isupper() else replacement.capitalize())
-        else:
-            out.append(w)
-    return "".join(out)
+
+def entity_swap(text: str, rng: random.Random) -> str:
+    tokens = _PROPER_NOUN_PAT.findall(text)
+    candidates = list({t for t in tokens if t.lower() not in _PERT_STOPWORDS})
+    if not candidates:
+        return text
+    n_swaps = min(2, len(candidates))
+    targets = rng.sample(candidates, n_swaps)
+    result = text
+    for target in targets:
+        replacement = rng.choice(_SWAP_POOL)
+        result = re.sub(r"\b" + re.escape(target) + r"\b", replacement, result)
+    return result
+
+
+# ---------- pronoun replacement ----------
+# Replaces all but the first occurrence of a repeated proper noun with a
+# neutral pronoun. Forces the model to resolve coreference for entity
+# extraction, stressing entity_omission.
+
+def pronoun_replacement(text: str, rng: random.Random) -> str:
+    tokens = _PROPER_NOUN_PAT.findall(text)
+    freq: dict[str, int] = {}
+    for t in tokens:
+        lower = t.lower()
+        if lower not in _PERT_STOPWORDS:
+            freq[lower] = freq.get(lower, 0) + 1
+    repeated = [lower for lower, c in freq.items() if c >= 2]
+    if not repeated:
+        return text
+    target_lower = rng.choice(repeated)
+    # use the first occurrence's capitalisation as the match target
+    target = next((t for t in tokens if t.lower() == target_lower), target_lower)
+    pronoun = rng.choice(["they", "it"])
+    first_seen = False
+
+    def replacer(m: re.Match) -> str:
+        nonlocal first_seen
+        if not first_seen:
+            first_seen = True
+            return m.group()
+        return pronoun
+
+    return re.sub(r"\b" + re.escape(target) + r"\b", replacer, text)
 
 
 # ---------- typo injection ----------
